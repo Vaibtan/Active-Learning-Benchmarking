@@ -5,3 +5,4 @@
 ./train_labels
 ./validation_images
 ./validation_labels
+run.ipynb
