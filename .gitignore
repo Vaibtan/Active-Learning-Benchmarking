@@ -1,8 +1,10 @@
-./models
-./test_images
-./test_labels
-./train_images
-./train_labels
-./validation_images
-./validation_labels
+models
+test_images
+test_labels
+train_images
+train_labels
+validation_images
+validation_labels
+.vscode
+__pycache__
 run.ipynb
