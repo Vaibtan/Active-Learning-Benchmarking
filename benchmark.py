@@ -188,8 +188,8 @@ class Trainer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description = "Active Learning for Species Seggregation")
-    parser.add_argument("--data", "-d", type = str, required = True, help = "Path to dataset")
-    parser.add_argument("--model", "-m", type = str, help = "Path to model weights")
+    parser.add_argument("--data", "-d", type = str, required = True, help = "Path to config")
+    parser.add_argument("--model", "-m", type = str, default="models/bestx.pt", help = "Path to model weights")
     parser.add_argument("--cycles", "-t", type = int, default = 4)
     parser.add_argument("--initial", type = float, default = 0.2)
     parser.add_argument("--budget", type = float, default = 0.05)
@@ -199,32 +199,48 @@ if __name__ == "__main__":
     parser.add_argument("--save_period", type = int, default = 10)
     args = parser.parse_args()
     
-    cfg = yaml.safe_load(open(args.data))
-    root = Path(cfg["path"])
-    train_imgs = [str(root/p) for p in cfg["train"]]
-    val_imgs   = [str(root/p) for p in cfg["val"]]
-    nc         = cfg["nc"]
+    try: cfg = yaml.safe_load(open(args.data))
+    except FileNotFoundError: print(f"Config file not found: {args.data}"); exit(1)
+    except yaml.YAMLError: print(f"Error parsing YAML file: {args.data}"); exit(1)
+    
+    if not Path(cfg["path"]).exists(): print(f"Dataset path not found: {cfg['path']}"); exit(1)
+    else: root = Path(cfg["path"])
+    
+    train_dir = root / cfg["train"]
+    val_dir = root / cfg["val"]
 
-    def load_annots(img_list):
+    train_imgs = [str(f) for f in train_dir.glob("*.jpg")] + \
+        [str(f) for f in train_dir.glob("*.jpeg")] + [str(f) for f in train_dir.glob("*.png")]
+
+    val_imgs = [str(f) for f in val_dir.glob("*.jpg")] + \
+        [str(f) for f in val_dir.glob("*.jpeg")] + [str(f) for f in val_dir.glob("*.png")]
+
+    num_classes: int = cfg["nc"]
+
+    def load_annotations(images: List[str], annotated_labels: str):
         ann = {}
-        for img in img_list:
-            txt = Path(img).with_suffix(".txt")
+        labels_dir = Path(annotated_labels)
+        for image in images:
+            image_path = Path(image)
+            txt_path = labels_dir.joinpath(f"{image_path.stem}.txt")
             boxes = []
-            if txt.exists():
-                w,h = Image.open(img).size
-                for L in open(txt):
-                    cls,x,y,bw,bh = map(float, L.split())
-                    x1 = (x - bw/2)*w;  x2 = (x + bw/2)*w
-                    y1 = (y - bh/2)*h;  y2 = (y + bh/2)*h
-                    boxes.append(((x1,y1,x2,y2), int(cls)))
-            ann[img] = boxes
+            if txt_path.exists():
+                try:
+                    w, h = Image.open(image).size
+                    for L in open(txt_path):
+                        cls, x, y, bw, bh = map(float, L.split())
+                        x1 = (x - bw / 2) * w;  x2 = (x + bw / 2) * w
+                        y1 = (y - bh / 2) * h;  y2 = (y + bh / 2) * h
+                        boxes.append(((x1, y1, x2, y2), int(cls)))
+                except Exception as e: print(f"Error processing {txt_path}: {e}")
+            ann[image] = boxes
         return ann
 
-    train_ann = load_annots(train_imgs)
-    val_ann   = load_annots(val_imgs)
+    train_ann = load_annotations(train_imgs, "train_labels/train_R2_merged_single")
+    val_ann   = load_annotations(val_imgs, "test_labels/test_R2_merged")
     model = YOLO(args.model)
     trainer = Trainer(model = model, train_set = train_imgs, train_ann = train_ann, \
-        test_set = val_imgs, test_ann = val_ann, num_classes = nc, config = args.data, \
+        test_set = val_imgs, test_ann = val_ann, num_classes = num_classes, config = args.data, \
             init_labeled = args.initial, budget_per_cycle = args.budget, workers = args.workers, \
                 batch_size = args.batch_size, epochs = args.epochs, save_period = args.save_period)
     metrics = trainer.benchmark(cycles = args.cycles)
