@@ -3,8 +3,9 @@ import torch.nn.functional as F
 import numpy as np
 import argparse 
 from algorithm import ImageData, DetectionInstance, EntropyNMS, DivProto
-from typing import List, Dict
+from typing import List, Dict, Tuple, Any, Optional
 from torchvision.ops import roi_pool
+import wandb
 from collections import defaultdict
 from tqdm import tqdm
 from pathlib import Path
@@ -74,7 +75,7 @@ class YOLOFeatureExtractor:
 class Trainer:
     def __init__(self, model: YOLO, train_set: List[str], test_set: List[str], \
         train_ann: Dict[str, List], test_ann: Dict[str, List], num_classes: int, \
-            config: str, init_labeled: float = 0.2, budget_per_cycle: float = 0.05, \
+            config: str, output_dir: str, init_labeled: float = 0.2, budget_per_cycle: float = 0.05, \
                 batch_size: int = 16, workers: int = 8, epochs: int = 10, save_period: int = 10) -> None:
         self.model = model
         self.device = "cuda" if T.cuda.is_available() else ("mps" if \
@@ -91,6 +92,7 @@ class Trainer:
         self.workers = workers
         self.epochs = epochs
         self.save_period = save_period
+        self.output_dir = output_dir
         self.enms = EntropyNMS(thresh = 0.5)
         self.divproto = DivProto(intra_thresh = 0.7, \
             inter_thresh = 0.3, alpha = 0.5, beta = 0.75)
@@ -133,19 +135,24 @@ class Trainer:
     
     def process_dataset(self, paths: List[str]) -> List[ImageData]:
         all_data = []
-        for i in tqdm(range(0, len(paths), self.batch_size), desc = "Processing images"):
+        for i in tqdm(range(0, len(paths), self.batch_size), \
+            desc = "Processing images", leave = False):
             batch_paths = paths[i : i + self.batch_size]
             batch_data = self.process_images_batch(batch_paths)
             all_data.extend(batch_data)
         return all_data
     
     def select_and_update(self) -> None:
+        print("Processing unlabeled dataset...")
         unlabeled_data = self.process_dataset(self.unlabeled)
+        print("Processing labeled dataset...")
         labeled_data   = self.process_dataset(self.labeled)
         budget = int(self.budget_per_cycle * len(self.train_set))
+        print(f"Selecting {budget} new samples...")
         selected_indices = self.divproto.select_samples(unlabeled_data, \
             labeled_data, budget, self.num_classes)
-        for index in sorted(selected_indices, reverse = True):
+        print(f"Adding {len(selected_indices)} samples to labeled set")
+        for index in tqdm(sorted(selected_indices, reverse = True), desc = "Updating training corpus ..."):
             path = self.unlabeled.pop(index)
             self.labeled.append(path)
     
@@ -154,34 +161,44 @@ class Trainer:
         base  = metrics["mAP"][0]
         gain  = [m - base for m in metrics["mAP"]]
 
-        fig, (ax1, ax2) = plt.subplots(1,2,figsize = (12,4))
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize = (12, 4))
         ax1.plot(pct, metrics["mAP"], marker = "o")
         ax1.set(xlabel = "% Labeled", ylabel = "mAP50", title = "mAP vs % Labeled")
         ax1.grid(True)
-
         ax2.plot(metrics["boxes"], gain, marker = "o", color = "tab:orange")
         ax2.set(xlabel = "Boxes Annotated", ylabel = "Δ mAP50", title = "mAP Gain vs. Cost")
         ax2.grid(True)
-
         plt.tight_layout()
+        wandb.log({"metrics_plots": wandb.Image(fig)})  
         plt.show()
         
     def benchmark(self, cycles: int = 4) -> Dict[str, List[float]]:
         metrics = {"cycle": [], "mAP": [], "labeled_size": [], "boxes": []}
-        for t in range(1, cycles + 1):
+        for t in tqdm(range(1, cycles + 1), desc = "active learning cycles", leave = True):
+            print(f"\nCycle {t} / {cycles}")
+            print("Training model...")
             self.model.train(data = self.config, workers = self.workers, \
                 batch = self.batch_size, epochs = self.epochs, save_period = self.save_period, \
-                    val = True, device = self.device, plots = True)
-            
-            results = self.model.val(data = self.config, device = self.device, \
-                batch = self.batch_size, workers = self.workers)
-            mAP = results.metrics["mAP50"]
+                    val = True if len(self.test_set) > 0 else False, device = self.device, \
+                        plots = True, project = self.output_dir, name = f"train_cycle_{t}")
+            print("Evaluating model...")
+            if len(self.test_set) > 0:
+                results = self.model.val(data = self.config, device = self.device, \
+                    batch = self.batch_size, workers = self.workers)
+                map_score = results.box.map50
+            else: print("Skipping eval due to empty val set"); map_score = 0.0
             metrics["cycle"].append(t)
-            metrics["mAP"].append(mAP)
+            metrics["mAP"].append(map_score)
             metrics["labeled_size"].append(len(self.labeled))
             total_boxes = sum(len(self.train_ann[p]) for p in self.labeled)
             metrics["boxes"].append(total_boxes)
-            self.select_and_update()
+            wandb.log({
+                "cycle": t,
+                "mAP50": map_score,
+                "labeled_size": len(self.labeled),
+                "total_boxes": total_boxes
+            })
+            if t < cycles: print("Selecting new samples..."); self.select_and_update()
         self.plot_metrics(metrics)
         return metrics
 
@@ -197,51 +214,61 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type = int, default = 8)
     parser.add_argument("--epochs", type = int, default = 10)
     parser.add_argument("--save_period", type = int, default = 10)
+    parser.add_argument("--output", type = str, default = "/mnt/nas/users/vaibhavt/Active-Learning-Benchmarking/results", \
+        help = "Directory to save results")
     args = parser.parse_args()
-    
     try: cfg = yaml.safe_load(open(args.data))
     except FileNotFoundError: print(f"Config file not found: {args.data}"); exit(1)
     except yaml.YAMLError: print(f"Error parsing YAML file: {args.data}"); exit(1)
-    
     if not Path(cfg["path"]).exists(): print(f"Dataset path not found: {cfg['path']}"); exit(1)
     else: root = Path(cfg["path"])
-    
     train_dir = root / cfg["train"]
     val_dir = root / cfg["val"]
-
-    train_imgs = [str(f) for f in train_dir.glob("*.jpg")] + \
-        [str(f) for f in train_dir.glob("*.jpeg")] + [str(f) for f in train_dir.glob("*.png")]
-
-    val_imgs = [str(f) for f in val_dir.glob("*.jpg")] + \
-        [str(f) for f in val_dir.glob("*.jpeg")] + [str(f) for f in val_dir.glob("*.png")]
+    train_imgs = [str(f) for f in tqdm(train_dir.glob("*.jpg"), \
+        desc = "Loading training data ...")]
+    val_imgs = [str(f) for f in tqdm(val_dir.glob("*.jpg"), \
+        desc = "Loading validation data ...")]
 
     num_classes: int = cfg["nc"]
 
     def load_annotations(images: List[str], annotated_labels: str):
         ann = {}
         labels_dir = Path(annotated_labels)
-        for image in images:
+        for image in tqdm(images, desc = "Loading annotations ...", leave = False):
             image_path = Path(image)
             txt_path = labels_dir.joinpath(f"{image_path.stem}.txt")
-            boxes = []
+            boxes: List[Tuple[Tuple[int, ...], int]] = []
             if txt_path.exists():
                 try:
                     w, h = Image.open(image).size
-                    for L in open(txt_path):
-                        cls, x, y, bw, bh = map(float, L.split())
-                        x1 = (x - bw / 2) * w;  x2 = (x + bw / 2) * w
-                        y1 = (y - bh / 2) * h;  y2 = (y + bh / 2) * h
-                        boxes.append(((x1, y1, x2, y2), int(cls)))
+                    with open(txt_path, 'r') as f:
+                        for L in f:
+                            L = L.strip()
+                            if not L: continue
+                            try:
+                                values = L.split()
+                                if len(values) != 5:
+                                    print(f"Invalid format in {txt_path}: Line '{L}'")
+                                    continue
+                                cls, x, y, bw, bh = map(float, L.split())
+                                x1 = (x - bw / 2) * w;  x2 = (x + bw / 2) * w
+                                y1 = (y - bh / 2) * h;  y2 = (y + bh / 2) * h
+                                boxes.append(((x1, y1, x2, y2), int(cls)))
+                            except ValueError as e: print(f"Error parsing line in {txt_path}: '{L}', {e}")
                 except Exception as e: print(f"Error processing {txt_path}: {e}")
             ann[image] = boxes
         return ann
-
     train_ann = load_annotations(train_imgs, "train_labels/train_R2_merged_single")
     val_ann   = load_annotations(val_imgs, "test_labels/test_R2_merged")
+    print(f"Number of validation images with annotations: {sum(1 for \
+        k in val_ann if val_ann[k])}")
+    run = wandb.init(project = "Species-Segregation-Benchmark", \
+        name = f"run-{args.cycles}-cycles")
     model = YOLO(args.model)
     trainer = Trainer(model = model, train_set = train_imgs, train_ann = train_ann, \
         test_set = val_imgs, test_ann = val_ann, num_classes = num_classes, config = args.data, \
             init_labeled = args.initial, budget_per_cycle = args.budget, workers = args.workers, \
-                batch_size = args.batch_size, epochs = args.epochs, save_period = args.save_period)
+                batch_size = args.batch_size, epochs = args.epochs, save_period = args.save_period, output_dir = args.output)
     metrics = trainer.benchmark(cycles = args.cycles)
     print("Final metrics:", metrics)
+    run.finish()

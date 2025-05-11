@@ -36,7 +36,7 @@ class ImageData:
         return T.stack([inst.features for inst in self.instances])
 
 
-class EntropyCalculator:    
+class Utils:    
     @staticmethod
     def calculate_entropy(prob: T.Tensor, _eps: float = 1e-7) -> T.Tensor:
         prob = T.clamp(prob, _eps, 1 - _eps)
@@ -45,7 +45,7 @@ class EntropyCalculator:
 class EntropyNMS:    
     def __init__(self, thresh: float = 0.5) -> None:
         self.thresh = thresh
-        self.entropy_calculator = EntropyCalculator()
+        self.entropy_calculator = Utils()
     
     def process(self, pred_classes: List[ClassID], \
         conf_scores: T.Tensor, inst_features: T.Tensor) -> Tuple[float, List[int]]:
@@ -76,7 +76,7 @@ class DivProto:
         alpha: float = 0.5, beta: float = 0.75) -> None:
         self.intra_thresh = intra_thresh; self.inter_thresh = inter_thresh
         self.alpha = alpha; self.beta = beta
-        self.entropy_calculator = EntropyCalculator()
+        self.entropy_calculator = Utils()
     
     def compute_class_protos(self, inst_features: T.Tensor, pred_classes: List[ClassID], \
         conf_scores: T.Tensor) -> Dict[ClassID, FeatureTensor]:
