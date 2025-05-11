@@ -8,3 +8,6 @@ validation_labels
 .vscode
 __pycache__
 run.ipynb
+yolo11n.pt
+test_images.cache
+train_images.cache
